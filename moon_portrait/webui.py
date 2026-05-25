@@ -15,6 +15,10 @@ Each run writes results/<run_id>/meta.json containing:
   - params:    the form dict used for the run (so the form can be repopulated)
   - summary:   n_raw / n_unique / n_pairs / elapsed_s / completed_at_utc
 
+Each run may also have a results/<run_id>/name.txt with a user-chosen
+display name (set via inline editing in the sidebar). This is independent
+of meta.json — legacy runs can be named too.
+
 The sidebar lists all directories under results/ that contain a meta.json,
 plus any "legacy" directories without meta.json (these can still be opened
 to view their map.html but won't repopulate the form).
@@ -30,8 +34,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from flask import (Flask, Response, redirect, render_template_string, request,
-                   send_from_directory, url_for)
+from flask import (Flask, Response, jsonify, redirect, render_template_string,
+                   request, send_from_directory, url_for)
 
 from .astro import AstroEngine
 from .dem import load_terrain
@@ -75,16 +79,34 @@ INDEX_HTML = """
                  height: 100%; color: #888; font-size: 14px; }
 
   .runs-list { margin-top: 6px; }
-  .run-row { display: flex; align-items: center; justify-content: space-between;
-             padding: 6px 8px; border-radius: 3px; font-size: 12px;
-             border: 1px solid transparent; }
+  .run-row { display: block; padding: 6px 8px; border-radius: 3px;
+             font-size: 12px; border: 1px solid transparent;
+             margin-bottom: 2px; }
   .run-row:hover { background: #ebebee; }
   .run-row.active { background: #d6e7f5; border-color: #aac8e1; }
-  .run-row.legacy { color: #999; font-style: italic; }
-  .run-row a { color: inherit; text-decoration: none; flex: 1; }
-  .run-row .meta { color: #777; font-size: 11px; }
-  .run-row .pairs { font-weight: bold; color: #1f78b4; }
+  .run-row.legacy .run-meta { font-style: italic; color: #999; }
+  .run-row a.run-load { color: inherit; text-decoration: none; display: block; }
+  .run-meta { color: #777; font-size: 11px; }
+  .pairs { font-weight: bold; color: #1f78b4; }
   .run-row.zero .pairs { color: #cc6600; }
+
+  .run-name-line { display: flex; align-items: center; gap: 4px; }
+  .run-name { flex: 1; padding: 1px 4px; border-radius: 2px;
+              border: 1px solid transparent; outline: none;
+              font-weight: 500; color: #222; min-height: 16px;
+              white-space: pre-wrap; word-break: break-word; }
+  .run-name[contenteditable="true"]:hover { border-color: #ccc;
+                                             background: white; cursor: text; }
+  .run-name[contenteditable="true"]:focus { border-color: #1f78b4;
+                                             background: white; }
+  .run-name.placeholder { color: #999; font-weight: 400; }
+  .rename-btn { background: none; border: none; color: #aaa;
+                cursor: pointer; padding: 0 4px; font-size: 13px;
+                width: auto; margin: 0; }
+  .rename-btn:hover { color: #1f78b4; background: none; }
+  .rename-status { font-size: 10px; color: #888; margin-left: 4px; }
+  .rename-status.error { color: #c33; }
+  .rename-status.ok { color: #2a8; }
 </style>
 <body>
   <aside>
@@ -161,6 +183,7 @@ INDEX_HTML = """
     {% if current_run %}
       <h2>Current run</h2>
       <div class="help">
+        {% if current_run.name %}<b>{{ current_run.name }}</b><br>{% endif %}
         Run <code>{{ current_run.run_id[:8] }}</code>
         {% if current_run.legacy %}
           &mdash; <i>legacy (no saved parameters)</i><br>
@@ -184,19 +207,32 @@ INDEX_HTML = """
         {% for r in runs %}
           <div class="run-row {% if current_run and r.run_id == current_run.run_id %}active{% endif %}
                               {% if r.legacy %}legacy{% endif %}
-                              {% if r.summary and r.summary.n_pairs == 0 %}zero{% endif %}">
-            <a href="/load/{{ r.run_id }}">
+                              {% if r.summary and r.summary.n_pairs == 0 %}zero{% endif %}"
+               data-run-id="{{ r.run_id }}">
+            <div class="run-name-line">
+              <span class="run-name {% if not r.name %}placeholder{% endif %}"
+                    data-run-id="{{ r.run_id }}"
+                    data-default="{{ r.run_id[:8] }}"
+                    title="Click to rename"
+              >{{ r.name or r.run_id[:8] }}</span>
+              <button class="rename-btn" title="Rename this run"
+                      onclick="event.preventDefault(); event.stopPropagation();
+                               focusName('{{ r.run_id }}');">✏️</button>
+              <span class="rename-status" data-run-id="{{ r.run_id }}"></span>
+            </div>
+            <a class="run-load" href="/load/{{ r.run_id }}">
               <div>
                 {% if r.legacy %}
-                  <code>{{ r.run_id[:8] }}</code> — <i>no metadata</i>
+                  <span class="run-meta">no saved parameters</span>
                 {% else %}
                   <span class="pairs">{{ r.summary.n_pairs }}</span> pair(s)
                   · {{ r.summary.n_unique }} timings
                 {% endif %}
               </div>
-              <div class="meta">
+              <div class="run-meta">
                 {% if r.summary %}{{ r.summary.completed_at_local }}{% else %}{{ r.mtime_local }}{% endif %}
                 {% if r.summary %}· {{ "%.1f"|format(r.summary.elapsed_s) }} s{% endif %}
+                · <code>{{ r.run_id[:8] }}</code>
               </div>
             </a>
           </div>
@@ -205,12 +241,93 @@ INDEX_HTML = """
     {% else %}
       <p class="help">No previous runs yet. Submit a search to create one.</p>
     {% endif %}
+
+    <script>
+      // Inline rename. The .run-name spans become contenteditable on focus.
+      (function() {
+        const spans = document.querySelectorAll('.run-name');
+        spans.forEach(span => {
+          span.setAttribute('contenteditable', 'plaintext-only');
+          // Some browsers don't support plaintext-only; fall back.
+          if (span.contentEditable !== 'plaintext-only') {
+            span.setAttribute('contenteditable', 'true');
+          }
+          let original = (span.classList.contains('placeholder')) ? '' : span.textContent;
+          span.addEventListener('focus', () => {
+            // Clear placeholder text on first edit so user types into empty.
+            if (span.classList.contains('placeholder')) {
+              span.textContent = '';
+              span.classList.remove('placeholder');
+            }
+            original = span.textContent;
+          });
+          span.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); span.blur(); }
+            else if (e.key === 'Escape') {
+              span.textContent = original || span.dataset.default;
+              if (!original) span.classList.add('placeholder');
+              span.blur();
+            }
+          });
+          span.addEventListener('blur', async () => {
+            const newName = span.textContent.replace(/\\s+/g, ' ').trim();
+            if (newName === original) {
+              // No change. Restore placeholder state if empty.
+              if (!newName) {
+                span.textContent = span.dataset.default;
+                span.classList.add('placeholder');
+              }
+              return;
+            }
+            const statusEl = document.querySelector(
+              `.rename-status[data-run-id="${span.dataset.runId}"]`);
+            statusEl.textContent = 'saving…';
+            statusEl.className = 'rename-status';
+            try {
+              const r = await fetch(`/rename/${span.dataset.runId}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name: newName}),
+              });
+              if (!r.ok) throw new Error(await r.text() || r.statusText);
+              original = newName;
+              if (!newName) {
+                span.textContent = span.dataset.default;
+                span.classList.add('placeholder');
+              }
+              statusEl.textContent = 'saved';
+              statusEl.className = 'rename-status ok';
+              setTimeout(() => { statusEl.textContent = ''; }, 1500);
+            } catch (err) {
+              span.textContent = original || span.dataset.default;
+              if (!original) span.classList.add('placeholder');
+              statusEl.textContent = 'error: ' + err.message;
+              statusEl.className = 'rename-status error';
+            }
+          });
+        });
+      })();
+      function focusName(runId) {
+        const span = document.querySelector(`.run-name[data-run-id="${runId}"]`);
+        if (!span) return;
+        span.focus();
+        // Move caret to end.
+        const range = document.createRange();
+        range.selectNodeContents(span);
+        range.collapse(false);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    </script>
   </aside>
   <main>
     {% if current_run %}
       <div class="topbar"
            style="{% if current_run.n_pairs == 0 %}background:#cc6600;{% endif %}">
-        <span>Run <code>{{ current_run.run_id[:8] }}</code> &mdash;
+        <span>
+          {% if current_run.name %}<b>{{ current_run.name }}</b> · {% endif %}
+          Run <code>{{ current_run.run_id[:8] }}</code> &mdash;
           {% if current_run.legacy %}
             (legacy run — no parameters saved; form left unchanged)
           {% elif current_run.n_pairs == 0 %}
@@ -251,6 +368,46 @@ DEFAULTS = dict(
 
 
 # ---- run-history helpers ----------------------------------------------------
+
+# Names are persisted as a plain UTF-8 text file alongside the run outputs.
+# Using a separate file rather than a meta.json field lets legacy runs (which
+# predate meta.json) be named too.
+NAME_FILENAME = "name.txt"
+MAX_NAME_LEN = 200
+
+
+def _read_name(run_dir: Path) -> str:
+    """Return the user-set name for a run, or '' if not set."""
+    p = run_dir / NAME_FILENAME
+    if not p.is_file():
+        return ""
+    try:
+        return _normalize_name(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        log.exception("failed to read %s", p)
+        return ""
+
+
+def _normalize_name(s: str) -> str:
+    """Strip control chars (replacing with space), collapse whitespace, cap length.
+
+    Replaces control characters with a space rather than dropping them so an
+    embedded \\x07 in "Bay\\x07test" yields "Bay test" rather than "Baytest".
+    """
+    cleaned = "".join(ch if (ord(ch) >= 0x20) else " " for ch in s)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:MAX_NAME_LEN]
+
+
+def _write_name(run_dir: Path, name: str) -> None:
+    """Persist the run's name. Empty string deletes the name file."""
+    p = run_dir / NAME_FILENAME
+    name = _normalize_name(name)
+    if not name:
+        if p.exists():
+            p.unlink()
+        return
+    p.write_text(name, encoding="utf-8")
 
 
 def _list_runs(results_dir: Path) -> list[dict]:
@@ -298,6 +455,7 @@ def _list_runs(results_dir: Path) -> list[dict]:
             mtime_local=datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"),
             legacy=legacy,
             summary=summary,
+            name=_read_name(d),
         ))
     runs.sort(key=lambda r: r["mtime"], reverse=True)
     return runs
@@ -315,7 +473,7 @@ def _read_meta(results_dir: Path, run_id: str) -> dict | None:
         return None
 
 
-def _run_record_from_meta(meta: dict, run_id: str) -> dict:
+def _run_record_from_meta(meta: dict, run_id: str, results_dir: Path) -> dict:
     """Build the dict that the template's `current_run` consumes."""
     s = meta.get("summary") or {}
     return dict(
@@ -325,6 +483,7 @@ def _run_record_from_meta(meta: dict, run_id: str) -> dict:
         n_pairs=s.get("n_pairs", 0),
         elapsed_s=s.get("elapsed_s"),
         legacy=False,
+        name=_read_name(results_dir / run_id),
     )
 
 
@@ -341,6 +500,7 @@ def _legacy_run_record(run_id: str, results_dir: Path) -> dict:
     return dict(
         run_id=run_id, n_raw=None, n_unique=n_unique, n_pairs=None,
         elapsed_s=None, legacy=True,
+        name=_read_name(results_dir / run_id),
     )
 
 
@@ -393,7 +553,7 @@ def create_app(data_dir: Path, results_dir: Path) -> Flask:
             # Legacy run — show its map but DON'T mutate the form fields.
             state["current_run"] = _legacy_run_record(run_id, results_dir)
         else:
-            state["current_run"] = _run_record_from_meta(meta, run_id)
+            state["current_run"] = _run_record_from_meta(meta, run_id, results_dir)
             params = meta.get("params") or {}
             # Only overwrite keys we know about, in case meta.json contains
             # extras from a newer version or a stale schema.
@@ -401,6 +561,25 @@ def create_app(data_dir: Path, results_dir: Path) -> Flask:
                 if k in params:
                     state["form"][k] = str(params[k])
         return redirect(url_for("index"))
+
+    @app.route("/rename/<run_id>", methods=["POST"])
+    def rename_run(run_id):
+        run_dir = (results_dir / run_id).resolve()
+        try:
+            run_dir.relative_to(results_dir)
+        except ValueError:
+            return Response("forbidden", status=403)
+        if not run_dir.is_dir():
+            return Response(f"run not found: {run_id}", status=404)
+        body = request.get_json(silent=True) or {}
+        name = body.get("name", "")
+        if not isinstance(name, str):
+            return Response("name must be a string", status=400)
+        _write_name(run_dir, name)
+        # If this is the active run, keep its display name in sync.
+        if state["current_run"] and state["current_run"]["run_id"] == run_id:
+            state["current_run"]["name"] = _normalize_name(name)
+        return jsonify(ok=True, name=_normalize_name(name))
 
     @app.route("/download/<run_id>/<path:fname>")
     def download(run_id, fname):
@@ -473,7 +652,8 @@ def _do_search(form: dict, data_dir: Path, results_dir: Path) -> dict:
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
 
     return dict(run_id=run_id, n_raw=len(raw), n_unique=len(dedup),
-                n_pairs=len(pairs), elapsed_s=elapsed, legacy=False)
+                n_pairs=len(pairs), elapsed_s=elapsed, legacy=False,
+                name="")
 
 
 def main():
