@@ -14,14 +14,46 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from datetime import timezone, timedelta
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import folium
+from folium import Element
 from folium.features import DivIcon
 
 from .search import Candidate
+
+
+# Color tokens — keep these in sync with the legend HTML below.
+CAMERA_COLOR = "#1f78b4"   # blue
+MODEL_COLOR = "#e31a1c"    # red
+LINE_COLOR = "#ffaa00"     # yellow-orange
+
+
+LEGEND_HTML = """
+<div style="position: absolute; bottom: 18px; left: 18px; z-index: 1000;
+            background: rgba(255,255,255,0.92); padding: 8px 12px;
+            border: 1px solid #888; border-radius: 4px;
+            font: 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2); line-height: 1.55;">
+  <div style="font-weight: 600; margin-bottom: 4px;">Legend</div>
+  <div><span style="color: %s; font-size: 16px; vertical-align: -1px;">●</span>
+       &nbsp;Camera (photographer)</div>
+  <div><span style="color: %s; font-size: 16px; vertical-align: -1px;">●</span>
+       &nbsp;Model (subject)</div>
+  <div style="display:flex; align-items:center; gap:4px;">
+    <svg width="44" height="10" viewBox="0 0 44 10">
+      <line x1="0" y1="5" x2="22" y2="5" stroke="%s" stroke-width="2"/>
+      <line x1="22" y1="5" x2="36" y2="5" stroke="%s" stroke-width="2"
+            stroke-dasharray="3,2"/>
+      <polygon points="36,1 44,5 36,9" fill="%s"/>
+    </svg>
+    &nbsp;Sight line; arrow points toward the Moon
+  </div>
+</div>
+""" % (CAMERA_COLOR, MODEL_COLOR, LINE_COLOR, LINE_COLOR, LINE_COLOR)
 
 
 # Pacific Time (used only for display; canonical timestamps stay UTC).
@@ -146,7 +178,6 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
     if not pairs:
         # Show a banner instead of a silent empty map.
         m = folium.Map(location=[37.39, -122.08], zoom_start=9)
-        from folium import Element
         banner = (
             '<div style="position:absolute;top:12px;left:50%;'
             'transform:translateX(-50%);z-index:10000;'
@@ -188,9 +219,15 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
         attr="Tiles &copy; Esri",
     ).add_to(m)
 
-    cam_layer = folium.FeatureGroup(name="Cameras", show=True).add_to(m)
-    mod_layer = folium.FeatureGroup(name="Models", show=True).add_to(m)
-    line_layer = folium.FeatureGroup(name="Sight lines", show=True).add_to(m)
+    cam_layer = folium.FeatureGroup(
+        name=f'<span style="color:{CAMERA_COLOR}">●</span> Cameras',
+        show=True).add_to(m)
+    mod_layer = folium.FeatureGroup(
+        name=f'<span style="color:{MODEL_COLOR}">●</span> Models',
+        show=True).add_to(m)
+    line_layer = folium.FeatureGroup(
+        name=f'<span style="color:{LINE_COLOR}">━▸</span> Sight lines',
+        show=True).add_to(m)
 
     for i, pair in enumerate(pairs):
         # Representative: the candidate within this pair with the best
@@ -244,28 +281,72 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
                    f"alt={rep.alt_required_deg:.1f}°, "
                    f"{len(pair)} timing(s)")
 
+        # Extension past the model in the Moon direction. Same horizontal
+        # bearing as camera→model (by construction the bearing equals the
+        # Moon's azimuth at the candidate time). We extend by 25% of the
+        # camera-model distance, capped at 150 m, in WGS84 lat/lon — fine
+        # for tiny offsets at mid-latitudes.
+        az_rad = math.radians(rep.az_required_deg)
+        ext_m = min(150.0, rep.distance_m * 0.25)
+        dlat = (ext_m * math.cos(az_rad)) / 111_320.0
+        dlon = (ext_m * math.sin(az_rad)) / (
+            111_320.0 * max(0.01, math.cos(math.radians(rep.model_lat))))
+        tip_lat = rep.model_lat + dlat
+        tip_lon = rep.model_lon + dlon
+
         # NOTE: folium.Popup is a stateful child object and cannot be
         # attached to multiple shapes — doing so produces an "undefined
         # bindPopup" JS error at load and silently kills every marker after
         # the first attachment. Build a fresh Popup per shape.
         folium.CircleMarker(
             location=[rep.camera_lat, rep.camera_lon], radius=6,
-            color="#1f78b4", fill=True, fill_opacity=0.85,
+            color=CAMERA_COLOR, fill=True, fill_opacity=0.85,
             popup=folium.Popup(popup_html, max_width=680), tooltip=tooltip,
         ).add_to(cam_layer)
         folium.CircleMarker(
             location=[rep.model_lat, rep.model_lon], radius=6,
-            color="#e31a1c", fill=True, fill_opacity=0.85,
+            color=MODEL_COLOR, fill=True, fill_opacity=0.85,
             popup=folium.Popup(popup_html, max_width=680), tooltip=tooltip,
         ).add_to(mod_layer)
+        # Solid segment: camera → model (the actual line of sight).
         folium.PolyLine(
             locations=[[rep.camera_lat, rep.camera_lon],
                        [rep.model_lat, rep.model_lon]],
-            color="#ffaa00", weight=2, opacity=0.7,
+            color=LINE_COLOR, weight=2, opacity=0.85,
             popup=folium.Popup(popup_html, max_width=680),
         ).add_to(line_layer)
+        # Dashed segment: model → tip, indicating the continuation toward the
+        # Moon (this is the path the Moon's light travels along to reach
+        # the camera's eye, grazing the model's head).
+        folium.PolyLine(
+            locations=[[rep.model_lat, rep.model_lon],
+                       [tip_lat, tip_lon]],
+            color=LINE_COLOR, weight=2, opacity=0.85,
+            dash_array="4,3",
+        ).add_to(line_layer)
+        # Arrowhead at the tip, rotated by the Moon's azimuth. The SVG is
+        # drawn pointing up (north = 0°), so a CSS rotate(az°) — clockwise
+        # from 12 o'clock — matches the bearing convention exactly.
+        arrow_html = (
+            f'<div style="transform: rotate({rep.az_required_deg}deg); '
+            f'transform-origin: 7px 7px; width: 14px; height: 14px;">'
+            f'<svg width="14" height="14" viewBox="0 0 14 14">'
+            f'<polygon points="7,0 13,12 1,12" fill="{LINE_COLOR}" '
+            f'stroke="#996600" stroke-width="0.5"/>'
+            f'</svg></div>'
+        )
+        folium.Marker(
+            location=[tip_lat, tip_lon],
+            icon=DivIcon(html=arrow_html, icon_size=(14, 14),
+                         icon_anchor=(7, 7), class_name="moon-arrow"),
+        ).add_to(line_layer)
 
-    folium.LayerControl().add_to(m)
+    # collapsed=False so the toggle list is open by default, and we set
+    # autoZIndex so feature-group labels can render the inline-colored swatches.
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    # On-map legend overlay (visible regardless of layer-control state).
+    m.get_root().html.add_child(Element(LEGEND_HTML))
 
     # Auto-fit map to encompass every candidate point. Without this, an
     # observer-centered start view may not include the actual pair locations.
