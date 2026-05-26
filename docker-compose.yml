@@ -1,0 +1,59 @@
+# Moon-portrait finder — Docker Compose stack.
+#
+# Designed to be deployed via Portainer Stacks (paste this whole file into
+# the Web editor and provide env vars), or via `docker compose up -d` from
+# the project directory.
+#
+# Required environment (put in a .env file next to this compose, or set in
+# Portainer's "environment variables" section):
+#
+#   RESULTS_PATH   absolute host path of moon_portrait_tool/results
+#                  e.g. /volume1/Mainshare/Insync/.../moon_portrait_tool/results
+#
+# Optional:
+#   TZ             timezone for log timestamps (default UTC)
+#
+# To publish on a host port other than 5000, edit the `ports:` mapping
+# below — Portainer's stack editor doesn't reliably substitute compose
+# variable defaults like ${VAR:-fallback}, so it's hardcoded.
+
+services:
+  moon-portrait:
+    # `build:` lets `docker compose up -d --build` build from the local
+    # Dockerfile. `image:` tags the result, so Portainer can also reference
+    # it as moon-portrait:latest after a one-time build.
+    image: moon-portrait:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: moon-portrait
+    restart: unless-stopped
+
+    # Use the host's network namespace. This avoids Docker's bridge plumbing
+    # entirely — the container's webui binds straight to <nas-ip>:5000 with
+    # no NAT, no port mapping, no firewall rules added or stripped by the
+    # Docker daemon. On Asustor / Synology / TrueNAS where bridge networking
+    # interacts awkwardly with the appliance firewall, this just works.
+    #
+    # Side effect: only one instance can hold port 5000 on the host. To run
+    # on a different port, change `--port 5000` in the Dockerfile's CMD (or
+    # override via the `command:` field here).
+    network_mode: host
+    # `ports:` is intentionally absent — it's ignored under network_mode: host
+    # and Portainer's UI shows "no published ports" for host-mode containers.
+    # The service is still reachable at http://<host-ip>:5000/.
+
+    volumes:
+      # Run outputs — bind-mounted to a Google Drive-synced host folder so
+      # the laptop can see the same results when not connected to the NAS.
+      - "${RESULTS_PATH:?RESULTS_PATH must be set — see .env.example}:/app/results"
+      # DEM tiles, Overpass responses, ephemeris (~hundreds of MB once
+      # warm). Persist across container restarts; no need to sync via
+      # Drive, so we use a named volume instead of a bind mount.
+      - moon_portrait_cache:/app/data
+    environment:
+      - TZ=${TZ:-UTC}
+
+volumes:
+  moon_portrait_cache:
+    name: moon_portrait_cache

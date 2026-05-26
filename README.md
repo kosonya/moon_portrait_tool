@@ -69,6 +69,129 @@ python -m moon_portrait.webui
 Sliders for every constraint; submit re-runs the search and renders the map
 inline. Each run's outputs are saved under `results/<run_id>/`.
 
+## Docker / NAS deployment
+
+A `Dockerfile` and `docker-compose.yml` are included so the server can run
+24/7 on a NAS (tested target: Asustor / Synology with Portainer), while the
+`results/` folder syncs to Google Drive — your laptop sees the same runs.
+
+### What gets containerized
+
+- The container always serves on port `5000` and writes to:
+  - `/app/results` — bind-mounted to a host folder you Google-Drive-sync
+  - `/app/data`    — Docker named volume (`moon_portrait_cache`) for DEM
+    tiles, OSM Overpass responses, and the JPL ephemeris; persists across
+    restarts but has no reason to sync.
+
+### Quick start — Docker Compose on the NAS
+
+```sh
+ssh into-the-nas
+cd /volume1/Mainshare/Insync/.../moon_portrait_tool
+cp .env.example .env       # fill in RESULTS_PATH, MOON_PORT, TZ
+docker compose up -d --build
+```
+
+`http://<nas-ip>:5000/` is now live; `docker compose logs -f` tails it.
+
+### Portainer Stack workflow
+
+1. SSH once to build the image: `docker build -t moon-portrait
+   /volume1/Mainshare/Insync/.../moon_portrait_tool`.
+2. In Portainer, **Stacks → Add stack**, name it `moon-portrait`.
+3. **Build method: Web editor** — paste the contents of `docker-compose.yml`.
+4. **Environment variables** — fill in at least `RESULTS_PATH`. Examples:
+   - `RESULTS_PATH=/volume1/Mainshare/Insync/sophia.m.kovaleva@gmail.com/Google Drive/proging/moon_photo/Moon portrait/moon_portrait_tool/results`
+   - `TZ=America/Los_Angeles`
+   - Host port is hardcoded to `5000` in the compose file. To use a
+     different one, edit the `ports:` mapping directly (Portainer's stack
+     editor doesn't reliably substitute `${VAR:-default}` defaults).
+5. **Deploy the stack**. After a few seconds it's up; Portainer's Container
+   view lets you start/stop/view logs/exec into it.
+
+When the source changes (you sync a new version via Drive), rebuild from
+SSH (`docker compose build` or `docker build -t moon-portrait …`) and
+Portainer's **Recreate** button on the container will pull the new image.
+
+### Browsing from the laptop without Docker
+
+The shared `results/` folder is the source of truth — every completed run
+is just files. To browse from your laptop while disconnected from the NAS,
+spin up a second copy of the web UI pointed at the synced folder:
+
+```sh
+cd ~/Insync/sophia.m.kovaleva@gmail.com/Google\ Drive/proging/moon_photo/Moon\ portrait/moon_portrait_tool
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python -m moon_portrait.webui  # opens at http://127.0.0.1:5000/
+```
+
+This local instance has its own DEM/Overpass cache (under `./data/`) but
+reads/writes the same `./results/` folder as the NAS instance via Insync.
+Running both at the same time is safe as long as only one is actively
+running searches — completed-run files don't conflict.
+
+### Notes
+
+- The Flask dev server (used inside the container) is fine for personal
+  LAN/VPN use. Don't expose port 5000 to the public Internet — no auth.
+- Paths with spaces in them (your `Moon portrait/` folder) work as bind
+  mounts as long as `RESULTS_PATH` in `.env` is unquoted but each part of
+  the path follows the literal name.
+- If your NAS has `docker compose` rather than the older `docker-compose`,
+  use the former. The compose file is v3.x and works with either.
+- The compose uses `network_mode: host` — the container shares the NAS's
+  network stack, binds straight to port 5000 with no NAT. Portainer
+  intentionally shows "no IP / no published ports" for host-mode
+  containers (that's not a bug — there literally aren't any to display,
+  the network namespace is the host's). The service is still reachable at
+  `http://<nas-ip>:5000/`.
+
+### Troubleshooting
+
+Container appears in `docker ps` with `Up 1 second` shortly after every
+poll, Portainer shows "no IP / no ports", browser gets
+`ERR_ADDRESS_UNREACHABLE` → the container is *crashing and restarting in a
+loop*. Get the actual reason:
+
+```sh
+docker logs --tail 100 moon-portrait
+docker inspect moon-portrait --format \
+  'status={{.State.Status}} restarts={{.RestartCount}} exit={{.State.ExitCode}} error={{.State.Error}}'
+```
+
+Common causes I've hit on NAS appliances:
+
+- **`PermissionError: [Errno 13]` writing to `/app/results`** — the
+  bind-mounted Google Drive folder is owned by your NAS user, not by
+  `root` (the container's default user). Fix on the NAS:
+  ```sh
+  chmod -R 0775 "$RESULTS_PATH"
+  # or, if it's owned by your user (uid 1000 commonly) and you can't change ownership:
+  # edit the Dockerfile to add: USER 1000:1000  before the CMD
+  ```
+- **`RESULTS_PATH` directory doesn't exist** — bind mounts (unlike named
+  volumes) refuse to create missing source paths. `mkdir -p` it first.
+- **Asustor / Synology NDP shipping a hardened sysctl** — once in a while
+  a kernel-level restriction blocks Python's socket bind. `docker logs`
+  will show a `PermissionError` at startup. Usually resolved by running
+  the container as host network mode (already configured above).
+
+Once the container is staying up (Status: `Up X seconds (healthy)` or
+`(health: starting)` that progresses to `healthy`), test reachability in
+order:
+
+```sh
+# from the NAS itself
+curl -fsS http://127.0.0.1:5000/status
+# from another machine on the LAN
+curl -fsS http://<nas-ip>:5000/status
+```
+
+If the first works but the second doesn't, it's the Asustor firewall (ADM
+→ Settings → Network → Network Defender / Firewall — add an inbound rule
+for TCP 5000 from your LAN subnet).
+
 ## Performance & tuning
 
 The search cost grows roughly with `cells(DEM) × samples(astronomy)`. Rough
