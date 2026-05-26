@@ -29,6 +29,7 @@ import argparse
 import csv
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,9 +40,11 @@ from flask import (Flask, Response, jsonify, redirect, render_template_string,
 
 from .astro import AstroEngine
 from .dem import load_terrain
-from .output import write_csv, write_geojson, write_map, cluster_by_pair
+from .output import (cluster_by_pair, write_blank_map, write_csv,
+                      write_geojson, write_map)
 from . import public_land
-from .search import Candidate, SearchConfig, deduplicate, search_windows
+from .search import (Candidate, SearchCancelled, SearchConfig, deduplicate,
+                     iter_search_windows)
 
 
 log = logging.getLogger("moon_portrait.webui")
@@ -116,6 +119,36 @@ INDEX_HTML = """
   .rename-status { font-size: 10px; color: #888; margin-left: 4px; }
   .rename-status.error { color: #c33; }
   .rename-status.ok { color: #2a8; }
+
+  .input-with-btn { display: flex; gap: 4px; align-items: stretch; }
+  .input-with-btn > input { flex: 1; }
+  .input-with-btn > button { width: auto; margin: 0; padding: 4px 10px;
+                              font-size: 11px; white-space: nowrap;
+                              background: #e6eef5; color: #1f78b4;
+                              border: 1px solid #c0d3e0; }
+  .input-with-btn > button:hover { background: #d6e7f5; color: #155a8a; }
+
+  .search-status { padding: 8px 14px; background: #fffbe6;
+                   border-top: 1px solid #e0d59a;
+                   font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                   display: flex; align-items: center; gap: 12px;
+                   flex-wrap: wrap; min-height: 22px; }
+  .search-status.done   { background: #e8f4ea; border-color: #b3d8b8; }
+  .search-status.cancelled { background: #fbe7d2; border-color: #d8a878; }
+  .search-status.error  { background: #fde2e2; border-color: #d89090; }
+  .search-status.idle   { display: none; }
+  .search-status .phase { font-weight: 600; text-transform: capitalize; }
+  .search-status .msg   { flex: 1; color: #555; }
+  .search-status .elapsed { color: #888; font-variant-numeric: tabular-nums; }
+  .search-status button, .search-status a.btn {
+    padding: 4px 10px; font-size: 11px; border-radius: 3px;
+    text-decoration: none; border: 1px solid #aaa; background: white;
+    cursor: pointer; color: #333;
+  }
+  .search-status button.stop { color: #c33; border-color: #c33; }
+  .search-status button.stop:hover { background: #c33; color: white; }
+  .search-status a.btn.view { color: #1f78b4; border-color: #1f78b4; }
+  .search-status a.btn.view:hover { background: #1f78b4; color: white; }
 </style>
 <body>
   <aside>
@@ -126,7 +159,13 @@ INDEX_HTML = """
 
       <h2>Region</h2>
       <label>BBox (west,south,east,north WGS84)</label>
-      <input name="bbox" value="{{ form.bbox }}" required>
+      <div class="input-with-btn">
+        <input name="bbox" value="{{ form.bbox }}" required>
+        <button type="button" onclick="useCurrentMapView()"
+                title="Set bbox to the area currently visible on the map, and center observer there">
+          use map view
+        </button>
+      </div>
       <div class="row">
         <div>
           <label>Observer lat</label>
@@ -136,6 +175,12 @@ INDEX_HTML = """
           <label>Observer lon</label>
           <input name="observer_lon" value="{{ form.observer_lon }}" type="number" step="0.0001">
         </div>
+      </div>
+      <div class="help">
+        Reference point for the astronomical math (Moon altitude / azimuth,
+        Sun altitude). At lunar distance, parallax across 100&nbsp;km is
+        ~0.015° &mdash; well below the alt-match tolerance &mdash; so anywhere
+        inside the bbox is fine. <em>Use map view</em> centers it on the bbox.
       </div>
       <div class="row">
         <div>
@@ -210,52 +255,17 @@ INDEX_HTML = """
       </div>
     {% endif %}
 
-    <h2>Previous runs ({{ runs|length }})</h2>
-    {% if runs %}
-      <div class="runs-list">
-        {% for r in runs %}
-          <div class="run-row {% if current_run and r.run_id == current_run.run_id %}active{% endif %}
-                              {% if r.legacy %}legacy{% endif %}
-                              {% if r.summary and r.summary.n_pairs == 0 %}zero{% endif %}"
-               data-run-id="{{ r.run_id }}">
-            <div class="run-name-line">
-              <span class="run-name {% if not r.name %}placeholder{% endif %}"
-                    data-run-id="{{ r.run_id }}"
-                    data-default="{{ r.run_id[:8] }}"
-                    title="Click to rename"
-              >{{ r.name or r.run_id[:8] }}</span>
-              <button class="rename-btn" title="Rename this run"
-                      onclick="event.preventDefault(); event.stopPropagation();
-                               focusName('{{ r.run_id }}');">✏️</button>
-              <span class="rename-status" data-run-id="{{ r.run_id }}"></span>
-            </div>
-            <a class="run-load" href="/load/{{ r.run_id }}">
-              <div>
-                {% if r.legacy %}
-                  <span class="run-meta">no saved parameters</span>
-                {% else %}
-                  <span class="pairs">{{ r.summary.n_pairs }}</span> pair(s)
-                  · {{ r.summary.n_unique }} timings
-                {% endif %}
-              </div>
-              <div class="run-meta">
-                {% if r.summary %}{{ r.summary.completed_at_local }}{% else %}{{ r.mtime_local }}{% endif %}
-                {% if r.summary %}· {{ "%.1f"|format(r.summary.elapsed_s) }} s{% endif %}
-                · <code>{{ r.run_id[:8] }}</code>
-              </div>
-            </a>
-          </div>
-        {% endfor %}
-      </div>
-    {% else %}
-      <p class="help">No previous runs yet. Submit a search to create one.</p>
-    {% endif %}
+    <div id="runs-section">{{ runs_section_html|safe }}</div>
 
     <script>
       // Inline rename. The .run-name spans become contenteditable on focus.
-      (function() {
+      // Idempotent: each span is marked once and skipped on subsequent calls,
+      // so we can rebind safely after the runs list is swapped in place.
+      function setupRunRenameHandlers() {
         const spans = document.querySelectorAll('.run-name');
         spans.forEach(span => {
+          if (span.dataset.renameBound === '1') return;
+          span.dataset.renameBound = '1';
           span.setAttribute('contenteditable', 'plaintext-only');
           // Some browsers don't support plaintext-only; fall back.
           if (span.contentEditable !== 'plaintext-only') {
@@ -315,7 +325,23 @@ INDEX_HTML = """
             }
           });
         });
-      })();
+      }
+      window.addEventListener('load', setupRunRenameHandlers);
+
+      // Live-refresh the previous-runs sidebar without reloading the page.
+      // Called after a background search transitions to a terminal phase.
+      async function refreshRunsList() {
+        try {
+          const r = await fetch('/runs/snippet', {cache: 'no-store'});
+          if (!r.ok) return;
+          const html = await r.text();
+          const section = document.getElementById('runs-section');
+          if (!section) return;
+          section.innerHTML = html;
+          setupRunRenameHandlers();
+        } catch (e) { /* network blip — try again on next status change */ }
+      }
+
       function focusName(runId) {
         const span = document.querySelector(`.run-name[data-run-id="${runId}"]`);
         if (!span) return;
@@ -327,6 +353,106 @@ INDEX_HTML = """
         const sel = window.getSelection();
         sel.removeAllRanges();
         sel.addRange(range);
+      }
+
+      // ---- search-status polling ---------------------------------------
+      // Always poll once on load; if a search is running we poll again
+      // every 1.5s. When it finishes we render a "View results" link and
+      // stop polling. Survives page reloads — status lives on the server.
+      let _pollTimer = null;
+      let _wasRunning = false;  // tracks running→not-running transition
+      function renderStatus(s) {
+        const panel = document.getElementById('search-status');
+        const ph    = document.getElementById('ss-phase');
+        const msg   = document.getElementById('ss-msg');
+        const el    = document.getElementById('ss-elapsed');
+        const stop  = document.getElementById('ss-stop');
+        const view  = document.getElementById('ss-view');
+        if (!s || (s.phase === 'idle' && !s.running)) {
+          panel.className = 'search-status idle';
+          return;
+        }
+        // Color the panel by phase
+        let cls = 'search-status';
+        if (s.phase === 'done')      cls += ' done';
+        else if (s.phase === 'cancelled') cls += ' cancelled';
+        else if (s.phase === 'error')     cls += ' error';
+        panel.className = cls;
+        // Text
+        ph.textContent = s.phase.replace(/_/g, ' ');
+        msg.textContent = s.message || '';
+        el.textContent = (s.elapsed_s != null)
+            ? `[${s.elapsed_s.toFixed(1)} s]` : '';
+        // Controls
+        if (s.running) {
+          stop.style.display = 'inline-block';
+          view.style.display = 'none';
+        } else {
+          stop.style.display = 'none';
+          if (s.run_id && (s.phase === 'done' || s.phase === 'cancelled')) {
+            view.style.display = 'inline-block';
+            view.href = '/load/' + s.run_id;
+            view.textContent = (s.phase === 'cancelled')
+                ? 'View partial results' : 'View results';
+          } else {
+            view.style.display = 'none';
+          }
+        }
+      }
+      async function pollStatus() {
+        try {
+          const r = await fetch('/status', {cache: 'no-store'});
+          const s = await r.json();
+          renderStatus(s);
+          // Detect a running→done transition and refresh the sidebar.
+          if (s && s.running) _wasRunning = true;
+          if (_wasRunning && s && !s.running) {
+            _wasRunning = false;
+            refreshRunsList();
+          }
+          clearTimeout(_pollTimer);
+          if (s && s.running) _pollTimer = setTimeout(pollStatus, 1500);
+        } catch (e) { /* network blip — try again */ _pollTimer = setTimeout(pollStatus, 3000); }
+      }
+      async function cancelSearch() {
+        if (!confirm('Stop the running search? Partial results will still be saved.'))
+          return;
+        await fetch('/cancel', {method: 'POST'});
+        pollStatus();
+      }
+      window.addEventListener('load', pollStatus);
+
+      // "use map view" button: copy the current Leaflet bounds into the
+      // bbox field and center observer on that bbox. Reaches into the
+      // iframe to find the Leaflet map instance.
+      function useCurrentMapView() {
+        const iframe = document.querySelector('iframe.map-frame');
+        if (!iframe || !iframe.contentWindow) {
+          alert("No map loaded. Run a search or load a previous run first.");
+          return;
+        }
+        const win = iframe.contentWindow;
+        let map = null;
+        for (const k in win) {
+          if (k.indexOf('map_') === 0 && win[k]
+              && typeof win[k].getBounds === 'function') {
+            map = win[k]; break;
+          }
+        }
+        if (!map) {
+          alert("Couldn't find the map inside the iframe. " +
+                "If the map is still loading, wait a moment and try again.");
+          return;
+        }
+        const b = map.getBounds();
+        const w = b.getWest().toFixed(4);
+        const s = b.getSouth().toFixed(4);
+        const e = b.getEast().toFixed(4);
+        const n = b.getNorth().toFixed(4);
+        document.querySelector('input[name="bbox"]').value = `${w},${s},${e},${n}`;
+        const c = b.getCenter();
+        document.querySelector('input[name="observer_lat"]').value = c.lat.toFixed(4);
+        document.querySelector('input[name="observer_lon"]').value = c.lng.toFixed(4);
       }
     </script>
   </aside>
@@ -357,11 +483,70 @@ INDEX_HTML = """
       </div>
       <iframe class="map-frame" src="/download/{{ current_run.run_id }}/map.html"></iframe>
     {% else %}
-      <div class="empty-state">Configure constraints on the left and click Search,
-        or select a previous run.</div>
+      <div class="topbar" style="background:#777;">
+        <span>No run selected &mdash; pan/zoom the map below, then click
+              <b>use map view</b> + <b>Search</b>, or pick a previous run.</span>
+      </div>
+      <iframe class="map-frame" src="/blank_map.html"></iframe>
     {% endif %}
+
+    <div id="search-status" class="search-status idle">
+      <span class="phase" id="ss-phase">idle</span>
+      <span class="msg"   id="ss-msg"></span>
+      <span class="elapsed" id="ss-elapsed"></span>
+      <button class="stop" id="ss-stop" style="display:none"
+              onclick="cancelSearch()">Stop</button>
+      <a class="btn view" id="ss-view" style="display:none">View results</a>
+    </div>
   </main>
 </body>
+"""
+
+
+# Rendered both by the initial page load (inlined into INDEX_HTML via
+# runs_section_html) and by GET /runs/snippet (for live refresh after a
+# background search finishes — JS swaps just this section's HTML).
+RUNS_SECTION_TEMPLATE = """
+<h2>Previous runs ({{ runs|length }})</h2>
+{% if runs %}
+  <div class="runs-list">
+    {% for r in runs %}
+      <div class="run-row {% if current_run and r.run_id == current_run.run_id %}active{% endif %}
+                          {% if r.legacy %}legacy{% endif %}
+                          {% if r.summary and r.summary.n_pairs == 0 %}zero{% endif %}"
+           data-run-id="{{ r.run_id }}">
+        <div class="run-name-line">
+          <span class="run-name {% if not r.name %}placeholder{% endif %}"
+                data-run-id="{{ r.run_id }}"
+                data-default="{{ r.run_id[:8] }}"
+                title="Click to rename"
+          >{{ r.name or r.run_id[:8] }}</span>
+          <button class="rename-btn" title="Rename this run"
+                  onclick="event.preventDefault(); event.stopPropagation();
+                           focusName('{{ r.run_id }}');">✏️</button>
+          <span class="rename-status" data-run-id="{{ r.run_id }}"></span>
+        </div>
+        <a class="run-load" href="/load/{{ r.run_id }}">
+          <div>
+            {% if r.legacy %}
+              <span class="run-meta">no saved parameters</span>
+            {% else %}
+              <span class="pairs">{{ r.summary.n_pairs }}</span> pair(s)
+              · {{ r.summary.n_unique }} timings
+            {% endif %}
+          </div>
+          <div class="run-meta">
+            {% if r.summary %}{{ r.summary.completed_at_local }}{% else %}{{ r.mtime_local }}{% endif %}
+            {% if r.summary %}· {{ "%.1f"|format(r.summary.elapsed_s) }} s{% endif %}
+            · <code>{{ r.run_id[:8] }}</code>
+          </div>
+        </a>
+      </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="help">No previous runs yet. Submit a search to create one.</p>
+{% endif %}
 """
 
 
@@ -607,11 +792,18 @@ def create_app(data_dir: Path, results_dir: Path) -> Flask:
     # after a restart.
     state = {"current_run": None, "form": dict(DEFAULTS)}
 
-    def render():
+    def _render_runs_section():
         runs = _list_runs(results_dir)
         return render_template_string(
+            RUNS_SECTION_TEMPLATE, runs=runs,
+            current_run=state["current_run"],
+        )
+
+    def render():
+        return render_template_string(
             INDEX_HTML, form=state["form"],
-            current_run=state["current_run"], runs=runs,
+            current_run=state["current_run"],
+            runs_section_html=_render_runs_section(),
         )
 
     @app.route("/", methods=["GET", "POST"])
@@ -619,13 +811,35 @@ def create_app(data_dir: Path, results_dir: Path) -> Flask:
         if request.method == "POST":
             form = {k: request.form.get(k, v) for k, v in DEFAULTS.items()}
             state["form"] = form
+            if active_search.is_running():
+                return (
+                    "<pre>A search is already running. Stop it via the "
+                    "panel below the map and try again.</pre>",
+                    409,
+                )
             try:
-                run = _do_search(form, data_dir, results_dir)
-            except Exception as e:
-                log.exception("search failed")
-                return f"<pre>Search failed: {e}</pre>", 500
-            state["current_run"] = run
+                active_search.start(form, data_dir, results_dir)
+            except Exception as e:  # noqa: BLE001
+                log.exception("failed to start search")
+                return f"<pre>Could not start search: {e}</pre>", 500
+            return redirect(url_for("index"))
         return render()
+
+    @app.route("/status")
+    def status():
+        return jsonify(active_search.status())
+
+    @app.route("/cancel", methods=["POST"])
+    def cancel():
+        ok = active_search.cancel()
+        return jsonify({"ok": ok})
+
+    @app.route("/runs/snippet")
+    def runs_snippet():
+        # Just the previous-runs section, for live refresh from JS without
+        # reloading the whole page. The same template that's inlined into
+        # the index on initial render.
+        return _render_runs_section()
 
     @app.route("/load/<run_id>")
     def load_run(run_id):
@@ -675,6 +889,24 @@ def create_app(data_dir: Path, results_dir: Path) -> Flask:
             state["current_run"]["name"] = _normalize_name(name)
         return jsonify(ok=True, name=_normalize_name(name))
 
+    @app.route("/blank_map.html")
+    def blank_map():
+        # Lazily generate (and cache to disk) a small empty Folium map for
+        # the default right-pane view. We center on the default observer
+        # location so the user lands somewhere reasonable for the Bay Area.
+        # Files in results_dir starting with "_" are not real runs and are
+        # ignored by _list_runs.
+        blank_path = results_dir / "_blank_map.html"
+        if not blank_path.is_file():
+            try:
+                center_lat = float(DEFAULTS["observer_lat"])
+                center_lon = float(DEFAULTS["observer_lon"])
+            except Exception:  # noqa: BLE001
+                center_lat, center_lon = 37.5, -121.87
+            write_blank_map(blank_path,
+                            center_lat=center_lat, center_lon=center_lon)
+        return send_from_directory(str(results_dir), "_blank_map.html")
+
     @app.route("/download/<run_id>/<path:fname>")
     def download(run_id, fname):
         run_dir = (results_dir / run_id).resolve()
@@ -698,78 +930,211 @@ def create_app(data_dir: Path, results_dir: Path) -> Flask:
 # ---- search execution -------------------------------------------------------
 
 
-def _do_search(form: dict, data_dir: Path, results_dir: Path) -> dict:
-    bbox = tuple(float(x) for x in form["bbox"].split(","))
-    assert len(bbox) == 4
-    t0 = datetime.fromisoformat(form["start"]).replace(tzinfo=timezone.utc)
-    t1 = datetime.fromisoformat(form["end"]).replace(tzinfo=timezone.utc)
+class ActiveSearch:
+    """Background search runner with cancellation + status reporting.
 
-    grid = load_terrain(bbox, float(form["dem_res"]),
-                        cache_dir=data_dir / "dem_cache")
-    eng = AstroEngine(float(form["observer_lat"]), float(form["observer_lon"]),
-                      ephem_dir=data_dir)
-    windows = eng.lunar_windows(
-        t0, t1,
-        alt_min_deg=float(form["alt_min"]),
-        alt_max_deg=float(form["alt_max"]),
-        sun_alt_max_deg=float(form["sun_alt_max"]),
-        phase_tolerance_deg=float(form["phase_tol"]),
-        sample_step_minutes=float(form["sample_step_min"]),
-    )
-    cfg = SearchConfig(
-        d_min_m=float(form["d_min"]), d_max_m=float(form["d_max"]),
-        alt_tol_deg=float(form["alt_tol"]),
-        dedup_xy_snap_m=float(form["snap_m"]),
-    )
-    t0_s = time.time()
-    raw = search_windows(grid, windows, cfg)
-    dedup = deduplicate(raw, cfg)
-    elapsed = time.time() - t0_s
+    Single-tenant (the UI doesn't expose parallel searches), so we keep all
+    state in module-level instance. The /status endpoint reads `_status`
+    under a lock; the /cancel endpoint flips the cancel event; the worker
+    thread checks the event between lunar windows.
+    """
 
-    # Hard filter: drop any candidate whose camera or model lat/lon falls
-    # inside an OSM water polygon (lake, reservoir, bay). This eliminates
-    # the "subject standing on a reservoir" nonsense candidates that
-    # otherwise sneak through when the DEM happens to give a flat low
-    # surface inside a water body.
-    water_idx = public_land.build_water_index_for_bbox(
-        bbox, cache_dir=data_dir / "public_cache")
-    dedup, n_dropped = public_land.filter_out_water(dedup, water_idx)
-    if n_dropped:
-        log.info("  water filter: dropped %d candidate(s) over lakes/reservoirs/bays",
-                 n_dropped)
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._cancel = threading.Event()
+        self._status: dict = {"running": False, "phase": "idle"}
 
-    # Heuristic public-land annotation: fetches OSM parks/protected-area
-    # polygons for the bbox (cached on disk), then point-in-polygon tests
-    # each candidate's camera and model. Failures are non-fatal — fields
-    # stay None and the UI public-only toggle becomes a no-op.
-    pl_index = public_land.build_index_for_bbox(
-        bbox, cache_dir=data_dir / "public_cache")
-    n_public = public_land.annotate(dedup, pl_index)
-    log.info("  public-land annotation: %d / %d pairs have BOTH points "
-             "in a public-access polygon", n_public, len(dedup))
+    # ---- public surface ----------------------------------------------------
 
-    pairs = cluster_by_pair(dedup, snap_m=float(form["snap_m"]))
-    dedup.sort(key=lambda c: (-c.distance_m,
-                              abs(c.alt_actual_deg - c.alt_required_deg)))
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._status.get("running", False)
 
-    run_id = uuid4().hex
-    out = results_dir / run_id
-    out.mkdir(parents=True, exist_ok=True)
-    write_csv(dedup, out / "candidates.csv")
-    write_geojson(dedup, out / "candidates.geojson")
-    write_map(dedup, out / "map.html")
+    def status(self) -> dict:
+        with self._lock:
+            s = dict(self._status)
+            # Recompute elapsed on every read so the timer ticks during
+            # long single phases (e.g. mid-window numpy work).
+            if s.get("started_at"):
+                s["elapsed_s"] = time.time() - s["started_at"]
+        return s
 
-    summary = dict(
-        n_raw=len(raw), n_unique=len(dedup), n_pairs=len(pairs),
-        elapsed_s=elapsed,
-        completed_at_utc=datetime.now(timezone.utc).isoformat(),
-    )
-    meta = dict(version=1, params=form, summary=summary)
-    (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    def cancel(self) -> bool:
+        if not self.is_running():
+            return False
+        self._cancel.set()
+        self._update(phase="cancelling", message="stop requested")
+        return True
 
-    return dict(run_id=run_id, n_raw=len(raw), n_unique=len(dedup),
-                n_pairs=len(pairs), elapsed_s=elapsed, legacy=False,
-                name="")
+    def start(self, form: dict, data_dir: Path, results_dir: Path) -> str:
+        with self._lock:
+            if self._status.get("running"):
+                raise RuntimeError("a search is already running")
+            self._cancel.clear()
+            run_id = uuid4().hex
+            self._status = {
+                "running": True, "phase": "preparing", "run_id": run_id,
+                "message": "", "windows_done": 0, "windows_total": None,
+                "n_raw": 0, "started_at": time.time(), "elapsed_s": 0.0,
+                "form": dict(form),
+            }
+        t = threading.Thread(
+            target=self._run, args=(form, data_dir, results_dir, run_id),
+            daemon=True, name=f"search-{run_id[:8]}",
+        )
+        with self._lock:
+            self._thread = t
+        t.start()
+        return run_id
+
+    # ---- internals ---------------------------------------------------------
+
+    def _update(self, **kwargs):
+        with self._lock:
+            self._status.update(kwargs)
+            if "started_at" in self._status:
+                self._status["elapsed_s"] = (
+                    time.time() - self._status["started_at"])
+
+    def _check_cancelled(self):
+        if self._cancel.is_set():
+            raise SearchCancelled()
+
+    def _run(self, form: dict, data_dir: Path, results_dir: Path,
+             run_id: str) -> None:
+        early_cancel = False
+        error: str | None = None
+        try:
+            self._do_search_impl(form, data_dir, results_dir, run_id)
+        except SearchCancelled:
+            early_cancel = True
+            log.info("search %s cancelled before any results", run_id[:8])
+        except Exception as e:  # noqa: BLE001
+            error = repr(e)
+            log.exception("background search %s failed", run_id[:8])
+        finally:
+            # Phase choice: error wins; otherwise if the cancel event was
+            # ever set (early or mid-loop), it's "cancelled"; else "done".
+            cancelled = early_cancel or self._cancel.is_set()
+            phase = ("error" if error else
+                     "cancelled" if cancelled else "done")
+            msg = (error or
+                   ("Stopped — partial results saved." if cancelled else
+                    "Search complete."))
+            self._update(running=False, phase=phase, message=msg)
+
+    def _do_search_impl(self, form: dict, data_dir: Path, results_dir: Path,
+                        run_id: str) -> None:
+        out = results_dir / run_id
+        out.mkdir(parents=True, exist_ok=True)
+
+        bbox = tuple(float(x) for x in form["bbox"].split(","))
+        assert len(bbox) == 4
+        t0 = datetime.fromisoformat(form["start"]).replace(tzinfo=timezone.utc)
+        t1 = datetime.fromisoformat(form["end"]).replace(tzinfo=timezone.utc)
+
+        self._update(phase="loading_dem",
+                     message="downloading/loading terrain…")
+        self._check_cancelled()
+        grid = load_terrain(bbox, float(form["dem_res"]),
+                            cache_dir=data_dir / "dem_cache")
+
+        self._update(phase="astronomy",
+                     message="finding lunar windows…")
+        self._check_cancelled()
+        eng = AstroEngine(float(form["observer_lat"]),
+                          float(form["observer_lon"]),
+                          ephem_dir=data_dir)
+        windows = eng.lunar_windows(
+            t0, t1,
+            alt_min_deg=float(form["alt_min"]),
+            alt_max_deg=float(form["alt_max"]),
+            sun_alt_max_deg=float(form["sun_alt_max"]),
+            phase_tolerance_deg=float(form["phase_tol"]),
+            sample_step_minutes=float(form["sample_step_min"]),
+        )
+        self._update(windows_total=len(windows),
+                     message=f"{len(windows)} lunar windows to scan")
+
+        cfg = SearchConfig(
+            d_min_m=float(form["d_min"]), d_max_m=float(form["d_max"]),
+            alt_tol_deg=float(form["alt_tol"]),
+            dedup_xy_snap_m=float(form["snap_m"]),
+        )
+
+        # ---- the long phase: scan windows incrementally ------------------
+        # Cancellation inside this loop just BREAKS — we still want to
+        # flow through dedup/filter/write so partial results land on disk.
+        # Cancellation BEFORE the loop (above) raises SearchCancelled, in
+        # which case there's nothing meaningful to save.
+        self._update(phase="searching",
+                     message=f"searching window 0/{len(windows)}…")
+        raw: list[Candidate] = []
+        search_t0 = time.time()
+        for i, w, cands in iter_search_windows(grid, windows, cfg):
+            raw.extend(cands)
+            self._update(windows_done=i + 1, n_raw=len(raw),
+                         message=(f"window {i+1}/{len(windows)} — "
+                                  f"{len(raw):,} raw candidates so far"))
+            if self._cancel.is_set():
+                log.info("cancellation detected mid-search; finalizing %d "
+                         "candidates from %d/%d windows",
+                         len(raw), i + 1, len(windows))
+                break
+        search_elapsed = time.time() - search_t0
+
+        # ---- the rest always runs (cancelled or not) so the user gets
+        # the partial picture in CSV/map form.
+        self._update(phase="dedup",
+                     message=f"deduplicating {len(raw):,} candidates…")
+        dedup = deduplicate(raw, cfg)
+
+        self._update(phase="water_filter",
+                     message="fetching water polygons (Overpass)…")
+        try:
+            water_idx = public_land.build_water_index_for_bbox(
+                bbox, cache_dir=data_dir / "public_cache")
+            dedup, n_water = public_land.filter_out_water(dedup, water_idx)
+            if n_water:
+                log.info("  water filter: dropped %d candidate(s)", n_water)
+        except Exception:  # noqa: BLE001
+            log.exception("water filter failed, continuing without it")
+
+        self._update(phase="public_annotation",
+                     message="fetching public-land polygons (Overpass)…")
+        try:
+            pl_index = public_land.build_index_for_bbox(
+                bbox, cache_dir=data_dir / "public_cache")
+            n_public = public_land.annotate(dedup, pl_index)
+            log.info("  public-land annotation: %d / %d both-public",
+                     n_public, len(dedup))
+        except Exception:  # noqa: BLE001
+            log.exception("public-land annotation failed; field will be None")
+
+        self._update(phase="writing",
+                     message=f"writing {len(dedup):,} candidates to disk…")
+        pairs = cluster_by_pair(dedup, snap_m=float(form["snap_m"]))
+        dedup.sort(key=lambda c: (-c.distance_m,
+                                  abs(c.alt_actual_deg - c.alt_required_deg)))
+        write_csv(dedup, out / "candidates.csv")
+        write_geojson(dedup, out / "candidates.geojson")
+        write_map(dedup, out / "map.html")
+
+        summary = dict(
+            n_raw=len(raw), n_unique=len(dedup), n_pairs=len(pairs),
+            elapsed_s=search_elapsed,
+            completed_at_utc=datetime.now(timezone.utc).isoformat(),
+            cancelled=self._cancel.is_set(),
+        )
+        meta = dict(version=1, params=form, summary=summary)
+        (out / "meta.json").write_text(json.dumps(meta, indent=2))
+
+        self._update(n_unique=len(dedup), n_pairs=len(pairs))
+
+
+# Module-level singleton — only one background search at a time.
+active_search = ActiveSearch()
 
 
 def main():

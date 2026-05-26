@@ -169,6 +169,46 @@ def write_geojson(cands: Sequence[Candidate], path: Path | str) -> None:
                                        "features": features}, indent=1))
 
 
+def write_blank_map(
+    path: Path | str,
+    center_lat: float = 37.5,
+    center_lon: float = -121.87,
+    zoom: int = 10,
+) -> None:
+    """Render an empty Leaflet map with the same base layers as a results map.
+
+    Used by the web UI as the default view before any run is loaded — gives
+    the user a real map to pan/zoom against so they can click "use map view"
+    next to the BBox field without having to first run a search.
+    """
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom,
+                   tiles=None)
+    folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        name="Satellite (Esri)", attr="Tiles &copy; Esri",
+    ).add_to(m)
+    folium.TileLayer(
+        tiles="https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        name="Topo (Esri)", attr="Tiles &copy; Esri",
+    ).add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    hint_html = (
+        '<div style="position: fixed; top: 14px; left: 50%; '
+        'transform: translateX(-50%); z-index: 1000; '
+        'background: rgba(255,255,255,0.94); padding: 8px 14px; '
+        'border: 1px solid #888; border-radius: 4px; '
+        'font: 13px -apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif; '
+        'box-shadow: 0 2px 4px rgba(0,0,0,0.2);">'
+        'Pan and zoom to your area of interest, then click '
+        '<b>use map view</b> next to BBox and <b>Search</b>.'
+        '</div>'
+    )
+    m.get_root().html.add_child(Element(hint_html))
+    m.save(str(path))
+
+
 def cluster_by_pair(
     cands: Sequence[Candidate], snap_m: float = 75.0
 ) -> list[list[Candidate]]:

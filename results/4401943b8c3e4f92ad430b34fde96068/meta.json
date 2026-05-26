@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "params": {
+    "bbox": "-121.7394,37.3219,-121.6724,37.3574",
+    "observer_lat": "37.3397",
+    "observer_lon": "-121.7059",
+    "start": "2026-05-25",
+    "end": "2026-08-01",
+    "d_min": "250",
+    "d_max": "500",
+    "alt_min": "3",
+    "alt_max": "20",
+    "sun_alt_max": "-10",
+    "phase_tol": "15",
+    "alt_tol": "0.15",
+    "dem_res": "30",
+    "sample_step_min": "10",
+    "snap_m": "75"
+  },
+  "summary": {
+    "n_raw": 6810,
+    "n_unique": 5849,
+    "n_pairs": 3169,
+    "elapsed_s": 2.14058780670166,
+    "completed_at_utc": "2026-05-26T02:03:09.082636+00:00"
+  }
+}

@@ -229,19 +229,38 @@ def search_window(
     return out
 
 
-def search_windows(
+class SearchCancelled(Exception):
+    """Raised when an external cancellation event is observed mid-search."""
+
+
+def iter_search_windows(
     grid: TerrainGrid,
     windows: Sequence[LunarWindow],
     cfg: SearchConfig,
-) -> list[Candidate]:
-    out = []
+):
+    """Generator: yield (window_idx, window, candidates_for_this_window).
+
+    Callers can cancel cooperatively by simply breaking out of the loop;
+    whatever they've accumulated so far is a valid partial result that
+    can still be dedup'd, water-filtered, and written.
+    """
     for i, w in enumerate(windows):
         reps = _dedupe_samples(w.samples, cfg.sample_az_bin_deg,
                                cfg.sample_alt_bin_deg)
         logger.info("Window %d/%d: %s..%s (%d->%d samples)",
                     i + 1, len(windows), w.start_utc, w.end_utc,
                     len(w.samples), len(reps))
-        out.extend(search_window(grid, reps, cfg))
+        yield i, w, search_window(grid, reps, cfg)
+
+
+def search_windows(
+    grid: TerrainGrid,
+    windows: Sequence[LunarWindow],
+    cfg: SearchConfig,
+) -> list[Candidate]:
+    out = []
+    for _, _, cands in iter_search_windows(grid, windows, cfg):
+        out.extend(cands)
     return out
 
 
