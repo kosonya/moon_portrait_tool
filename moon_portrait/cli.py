@@ -36,7 +36,11 @@ def main():
     ap.add_argument("--d-max", type=float, default=500.0)
     ap.add_argument("--alt-min", type=float, default=3.0)
     ap.add_argument("--alt-max", type=float, default=20.0)
-    ap.add_argument("--sun-alt-max", type=float, default=-10.0)
+    ap.add_argument("--sun-alt-max", type=float, default=-10.0,
+                    help="upper sun-altitude bound (default −10° = astro twilight)")
+    ap.add_argument("--sun-alt-min", type=float, default=-90.0,
+                    help="lower sun-altitude bound (default −90° = no lower limit; "
+                         "set to 0 for daytime-only searches)")
     ap.add_argument("--phase-tol", type=float, default=15.0,
                     help="±phase tolerance from full moon (degrees)")
     ap.add_argument("--alt-tol", type=float, default=0.15,
@@ -77,6 +81,7 @@ def main():
         t0, t1,
         alt_min_deg=args.alt_min, alt_max_deg=args.alt_max,
         sun_alt_max_deg=args.sun_alt_max,
+        sun_alt_min_deg=args.sun_alt_min,
         phase_tolerance_deg=args.phase_tol,
         sample_step_minutes=args.sample_step_min,
     )

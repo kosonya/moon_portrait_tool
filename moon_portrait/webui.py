@@ -216,8 +216,22 @@ INDEX_HTML = """
           <input name="alt_max" value="{{ form.alt_max }}" type="number" step="0.5">
         </div>
       </div>
-      <label>Sun alt max ° (≤ -10 = astro twilight)</label>
-      <input name="sun_alt_max" value="{{ form.sun_alt_max }}" type="number" step="0.5">
+      <label>Sun altitude range ° (sun_alt must be between min and max)</label>
+      <div class="row">
+        <div>
+          <label>Sun alt min</label>
+          <input name="sun_alt_min" value="{{ form.sun_alt_min }}" type="number" step="0.5">
+        </div>
+        <div>
+          <label>Sun alt max</label>
+          <input name="sun_alt_max" value="{{ form.sun_alt_max }}" type="number" step="0.5">
+        </div>
+      </div>
+      <div class="help">
+        Defaults <code>−90</code>&nbsp;to&nbsp;<code>−10</code> = night
+        (sun at least 10° below horizon = astro twilight). For daytime
+        photos, set min to <code>0</code> and max to <code>90</code>.
+      </div>
       <label>Phase tolerance ° (from full moon)</label>
       <input name="phase_tol" value="{{ form.phase_tol }}" type="number" step="0.5">
       <label>Alt match tolerance °</label>
@@ -556,7 +570,8 @@ DEFAULTS = dict(
     start="2026-05-24", end="2026-08-01",
     d_min="250", d_max="500",
     alt_min="3", alt_max="20",
-    sun_alt_max="-10", phase_tol="15", alt_tol="0.15",
+    sun_alt_min="-90", sun_alt_max="-10",
+    phase_tol="15", alt_tol="0.15",
     dem_res="30", sample_step_min="10", snap_m="75",
 )
 
@@ -1051,6 +1066,7 @@ class ActiveSearch:
             alt_min_deg=float(form["alt_min"]),
             alt_max_deg=float(form["alt_max"]),
             sun_alt_max_deg=float(form["sun_alt_max"]),
+            sun_alt_min_deg=float(form.get("sun_alt_min", -90)),
             phase_tolerance_deg=float(form["phase_tol"]),
             sample_step_minutes=float(form["sample_step_min"]),
         )

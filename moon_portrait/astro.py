@@ -119,17 +119,24 @@ class AstroEngine:
         alt_min_deg: float = 3.0,
         alt_max_deg: float = 20.0,
         sun_alt_max_deg: float = -10.0,
+        sun_alt_min_deg: float = -90.0,
         phase_tolerance_deg: float = 15.0,
         coarse_step_minutes: float = 5.0,
         sample_step_minutes: float = 2.0,
     ) -> list[LunarWindow]:
         """Find lunar windows matching all constraints between t0 and t1.
 
+        Sun-altitude band: sample passes iff sun_alt_min ≤ sun_alt ≤ sun_alt_max.
+        Defaults give the original nighttime behavior (any sun altitude
+        from horizon-pole down through −90° works, as long as the sun is also
+        below sun_alt_max = −10° = astronomical twilight). Set
+        sun_alt_min_deg=0 (and sun_alt_max_deg=90) for daytime-only searches.
+
         Algorithm:
           1. Find every full moon in [t0 - tol, t1 + tol] where tol corresponds
              to phase_tolerance_deg (Moon moves ~12°/day so 15° ≈ 30 hr).
           2. For each full moon, scan a ±N-day window at coarse_step_minutes
-             granularity; flag samples passing all 3 constraints.
+             granularity; flag samples passing all constraints.
           3. Merge consecutive passing samples into windows; resample each
              window at sample_step_minutes for the final trajectory.
         """
@@ -152,7 +159,8 @@ class AstroEngine:
             windows.extend(self._scan_around_full_moon(
                 scan_start, scan_end,
                 alt_min_deg, alt_max_deg,
-                sun_alt_max_deg, phase_tolerance_deg,
+                sun_alt_max_deg, sun_alt_min_deg,
+                phase_tolerance_deg,
                 coarse_step_minutes, sample_step_minutes,
             ))
         return windows
@@ -162,7 +170,8 @@ class AstroEngine:
         scan_start: datetime,
         scan_end: datetime,
         alt_min: float, alt_max: float,
-        sun_alt_max: float, phase_tol: float,
+        sun_alt_max: float, sun_alt_min: float,
+        phase_tol: float,
         coarse_step_min: float, sample_step_min: float,
     ) -> list[LunarWindow]:
         # Coarse pass: vectorized over a numpy array of times.
@@ -189,6 +198,7 @@ class AstroEngine:
             (moon_alt >= alt_min) &
             (moon_alt <= alt_max) &
             (sun_alt <= sun_alt_max) &
+            (sun_alt >= sun_alt_min) &
             (np.abs(phase - 180.0) <= phase_tol)
         )
 
