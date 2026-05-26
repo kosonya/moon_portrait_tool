@@ -88,6 +88,10 @@ class Candidate:
     model_lon: float
     moon_phase_deg: float
     sun_alt_deg: float
+    # Optional OSM-derived "is in a public-access polygon" annotation.
+    # None = not annotated (skipped or failed). Set by public_land.annotate().
+    camera_public: bool | None = None
+    model_public: bool | None = None
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)

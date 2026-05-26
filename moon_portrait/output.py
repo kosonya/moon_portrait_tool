@@ -33,9 +33,20 @@ LINE_COLOR = "#ffaa00"     # yellow-orange
 
 
 LEGEND_HTML = """
-<div style="position: absolute; bottom: 18px; left: 18px; z-index: 1000;
+<style>
+  /* When this class is on the map root, hide all non-public pairs.
+     Markers without a public class (no annotation) are never hidden,
+     so the toggle becomes a no-op for candidates that lack the column. */
+  .hide-non-public .pair-private { display: none !important; }
+  .pair-public-toggle { margin-top: 6px; padding-top: 6px;
+                        border-top: 1px solid #ddd; font-size: 11px;
+                        color: #444; }
+  .pair-public-toggle input { margin-right: 4px; vertical-align: -1px; }
+  .pair-public-toggle .hint { color: #888; font-style: italic; }
+</style>
+<div style="position: fixed; bottom: 18px; left: 18px; z-index: 1000;
             background: rgba(255,255,255,0.92); padding: 8px 12px;
-            border: 1px solid #888; border-radius: 4px;
+            border: 1px solid #888; border-radius: 4px; max-width: 320px;
             font: 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             box-shadow: 0 2px 4px rgba(0,0,0,0.2); line-height: 1.55;">
   <div style="font-weight: 600; margin-bottom: 4px;">Legend</div>
@@ -51,6 +62,18 @@ LEGEND_HTML = """
       <polygon points="36,1 44,5 36,9" fill="%s"/>
     </svg>
     &nbsp;Sight line; arrow points toward the Moon
+  </div>
+  <div class="pair-public-toggle">
+    <label>
+      <input type="checkbox"
+             onchange="document.documentElement.classList.toggle(
+                       'hide-non-public', this.checked)">
+      Show only likely-public pairs
+    </label>
+    <div class="hint">
+      Filters out pairs where either point lies outside an OSM
+      park / protected area. Heuristic — verify before traveling.
+    </div>
   </div>
 </div>
 """ % (CAMERA_COLOR, MODEL_COLOR, LINE_COLOR, LINE_COLOR, LINE_COLOR)
@@ -122,6 +145,8 @@ def write_geojson(cands: Sequence[Candidate], path: Path | str) -> None:
                 "elev_gain_m": c.elev_gain_m,
                 "moon_phase_deg": c.moon_phase_deg,
                 "sun_alt_deg": c.sun_alt_deg,
+                "camera_public": c.camera_public,
+                "model_public": c.model_public,
             },
         })
         features.append({
@@ -129,14 +154,16 @@ def write_geojson(cands: Sequence[Candidate], path: Path | str) -> None:
             "geometry": {"type": "Point",
                          "coordinates": [c.camera_lon, c.camera_lat]},
             "properties": {"id": i, "kind": "camera",
-                           "elev_m": c.camera_elev_m},
+                           "elev_m": c.camera_elev_m,
+                           "public": c.camera_public},
         })
         features.append({
             "type": "Feature",
             "geometry": {"type": "Point",
                          "coordinates": [c.model_lon, c.model_lat]},
             "properties": {"id": i, "kind": "model",
-                           "elev_m": c.model_elev_m},
+                           "elev_m": c.model_elev_m,
+                           "public": c.model_public},
         })
     Path(path).write_text(json.dumps({"type": "FeatureCollection",
                                        "features": features}, indent=1))
@@ -229,10 +256,36 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
         name=f'<span style="color:{LINE_COLOR}">━▸</span> Sight lines',
         show=True).add_to(m)
 
+    # Pair metadata for the post-render JS tagger. Folium's `className`
+    # kwarg on CircleMarker / PolyLine is not consistently honored across
+    # versions, so instead of relying on it we tag the rendered SVG paths
+    # and DivIcons from JavaScript once Leaflet has finished rendering.
+    pair_js_data: list[dict] = []
+
     for i, pair in enumerate(pairs):
         # Representative: the candidate within this pair with the best
         # alt-match.
         rep = min(pair, key=lambda c: abs(c.alt_actual_deg - c.alt_required_deg))
+
+        # Public-land status for the pair. Three states:
+        #   "pair-public":  both points in a public-access polygon
+        #   "pair-private": at least one outside (or annotation says False)
+        #   "":             not annotated (None) — toggle won't affect it
+        cam_pub = rep.camera_public
+        mod_pub = rep.model_public
+        if cam_pub is None and mod_pub is None:
+            public_class = ""        # toggle does nothing for this pair
+            public_label = ""
+        elif cam_pub and mod_pub:
+            public_class = "pair-public"
+            public_label = ("<br><span style='color:#2a8'>✓</span> "
+                            "Both points likely on public land (OSM)")
+        else:
+            public_class = "pair-private"
+            camp_t = "in park" if cam_pub else "outside park"
+            modp_t = "in park" if mod_pub else "outside park"
+            public_label = (f"<br><span style='color:#c33'>!</span> "
+                            f"camera {camp_t}; model {modp_t} (OSM)")
 
         # Build a table of all timing opportunities for this pair.
         pair_sorted = sorted(pair, key=lambda c: c.time_utc)
@@ -257,7 +310,8 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
             f"({rep.camera_elev_m:.0f} m)<br>"
             f"model:  {rep.model_lat:.5f}, {rep.model_lon:.5f} "
             f"({rep.model_elev_m:.0f} m)<br>"
-            f"compass: {_compass(rep.az_required_deg)}<br><br>"
+            f"compass: {_compass(rep.az_required_deg)}"
+            f"{public_label}<br><br>"
             "<table style='border-collapse:collapse;font-size:11px'>"
             "<tr style='background:#eee;font-weight:bold'>"
             "<td style='padding:2px 6px'>Local time</td>"
@@ -341,12 +395,99 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
                          icon_anchor=(7, 7), class_name="moon-arrow"),
         ).add_to(line_layer)
 
+        # Stash pair geometry + intended public class for the JS tagger
+        # to find by lat/lon. Only emit pairs with a known class — pairs
+        # with public_class="" (no annotation) are left untouched and the
+        # toggle is a no-op for them.
+        if public_class:
+            pair_js_data.append({
+                "cam": [rep.camera_lat, rep.camera_lon],
+                "mod": [rep.model_lat, rep.model_lon],
+                "tip": [tip_lat, tip_lon],
+                "cls": public_class,
+            })
+
     # collapsed=False so the toggle list is open by default, and we set
     # autoZIndex so feature-group labels can render the inline-colored swatches.
     folium.LayerControl(collapsed=False).add_to(m)
 
     # On-map legend overlay (visible regardless of layer-control state).
     m.get_root().html.add_child(Element(LEGEND_HTML))
+
+    # Post-render JS that tags rendered Leaflet elements with the correct
+    # pair-public / pair-private class. This is more robust than relying on
+    # Folium to pass `className` through CircleMarker/PolyLine, which is
+    # version-dependent in practice.
+    tagger_data_json = json.dumps(pair_js_data)
+    tagger_js = f"""
+<script>
+(function() {{
+  const PAIRS = {tagger_data_json};
+  if (!PAIRS.length) return;
+  const EPS = 1e-6;
+  function near(a, b) {{
+    return Math.abs(a[0] - b[0]) < EPS && Math.abs(a[1] - b[1]) < EPS;
+  }}
+  function tagAll() {{
+    // Locate the Leaflet map instance Folium created.
+    let map = null;
+    for (const k in window) {{
+      if (k.indexOf('map_') === 0 && window[k]
+          && typeof window[k].eachLayer === 'function') {{
+        map = window[k]; break;
+      }}
+    }}
+    if (!map || typeof L === 'undefined') {{ return setTimeout(tagAll, 100); }}
+    let tagged = 0;
+    map.eachLayer(function(layer) {{
+      // CircleMarker (camera / model dots): match by single lat/lon.
+      if (layer instanceof L.CircleMarker && typeof layer.getLatLng === 'function'
+          && !(layer instanceof L.Marker)) {{
+        const ll = layer.getLatLng();
+        const p = [ll.lat, ll.lng];
+        for (const pr of PAIRS) {{
+          if (near(p, pr.cam) || near(p, pr.mod)) {{
+            if (layer._path) {{ layer._path.classList.add(pr.cls); tagged++; }}
+            break;
+          }}
+        }}
+      }}
+      // Polyline (solid and dashed segments): match by both endpoints.
+      if (layer instanceof L.Polyline && !(layer instanceof L.Polygon)
+          && !(layer instanceof L.CircleMarker)) {{
+        const lls = layer.getLatLngs();
+        if (lls.length >= 2) {{
+          const a = [lls[0].lat, lls[0].lng];
+          const b = [lls[1].lat, lls[1].lng];
+          for (const pr of PAIRS) {{
+            if ((near(a, pr.cam) && near(b, pr.mod)) ||
+                (near(a, pr.mod) && near(b, pr.tip))) {{
+              if (layer._path) {{ layer._path.classList.add(pr.cls); tagged++; }}
+              break;
+            }}
+          }}
+        }}
+      }}
+      // Marker (the arrow at the tip): match by tip lat/lon.
+      if (layer instanceof L.Marker && typeof layer.getLatLng === 'function') {{
+        const ll = layer.getLatLng();
+        const p = [ll.lat, ll.lng];
+        for (const pr of PAIRS) {{
+          if (near(p, pr.tip)) {{
+            if (layer._icon) {{ layer._icon.classList.add(pr.cls); tagged++; }}
+            break;
+          }}
+        }}
+      }}
+    }});
+    window.__pairTagsApplied = tagged;
+  }}
+  if (document.readyState === 'complete') tagAll();
+  else window.addEventListener('load', tagAll);
+}})();
+</script>
+"""
+    m.get_root().html.add_child(Element(tagger_js))
 
     # Auto-fit map to encompass every candidate point. Without this, an
     # observer-centered start view may not include the actual pair locations.
