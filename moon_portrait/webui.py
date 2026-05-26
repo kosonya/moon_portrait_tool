@@ -726,6 +726,18 @@ def _do_search(form: dict, data_dir: Path, results_dir: Path) -> dict:
     dedup = deduplicate(raw, cfg)
     elapsed = time.time() - t0_s
 
+    # Hard filter: drop any candidate whose camera or model lat/lon falls
+    # inside an OSM water polygon (lake, reservoir, bay). This eliminates
+    # the "subject standing on a reservoir" nonsense candidates that
+    # otherwise sneak through when the DEM happens to give a flat low
+    # surface inside a water body.
+    water_idx = public_land.build_water_index_for_bbox(
+        bbox, cache_dir=data_dir / "public_cache")
+    dedup, n_dropped = public_land.filter_out_water(dedup, water_idx)
+    if n_dropped:
+        log.info("  water filter: dropped %d candidate(s) over lakes/reservoirs/bays",
+                 n_dropped)
+
     # Heuristic public-land annotation: fetches OSM parks/protected-area
     # polygons for the bbox (cached on disk), then point-in-polygon tests
     # each candidate's camera and model. Failures are non-fatal — fields

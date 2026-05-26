@@ -61,45 +61,62 @@ PUBLIC_FILTERS = [
     "landuse=recreation_ground",
 ]
 
+# OSM filters for water bodies — used to exclude candidates whose camera or
+# model would otherwise land in a lake, reservoir, or bay.
+WATER_FILTERS = [
+    "natural=water",
+    "landuse=reservoir",
+    "natural=bay",
+    "natural=strait",
+    "waterway=riverbank",
+]
 
-def _bbox_cache_key(bbox: tuple[float, float, float, float]) -> str:
+
+def _bbox_cache_key(
+    bbox: tuple[float, float, float, float], salt: str = "",
+) -> str:
     """Round bbox to a coarse grid so neighbouring searches reuse one cache."""
     rounded = tuple(round(v, 2) for v in bbox)
-    return hashlib.sha1(repr(rounded).encode()).hexdigest()[:16]
+    return hashlib.sha1((salt + repr(rounded)).encode()).hexdigest()[:16]
 
 
-def _build_overpass_query(bbox: tuple[float, float, float, float]) -> str:
+def _build_overpass_query(
+    bbox: tuple[float, float, float, float], filters: Sequence[str],
+) -> str:
     # Overpass bbox order is (south, west, north, east).
     w, s, e, n = bbox
     bbox_s = f"{s},{w},{n},{e}"
     parts = []
-    for filt in PUBLIC_FILTERS:
+    for filt in filters:
         parts.append(f"way[{filt}]({bbox_s})")
         parts.append(f"relation[{filt}]({bbox_s})")
     union = ";\n  ".join(parts)
     return f"[out:json][timeout:{OVERPASS_TIMEOUT_S}];\n(\n  {union};\n);\nout geom;"
 
 
-def fetch_public_osm(
+def fetch_osm_polygons(
     bbox: tuple[float, float, float, float],
+    filters: Sequence[str],
     cache_dir: str | Path,
+    cache_prefix: str = "osm",
     overpass_url: str = OVERPASS_URL,
 ) -> dict | None:
-    """Return raw Overpass JSON for `bbox`, using disk cache when present.
+    """Return raw Overpass JSON for `bbox` and `filters`, using disk cache.
 
-    On network failure returns None — caller falls back to "no annotation".
+    On network failure returns None — caller falls back to no annotation
+    / no filtering.
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = _bbox_cache_key(bbox)
-    cache_path = cache_dir / f"public_{key}.json"
+    key = _bbox_cache_key(bbox, salt=cache_prefix)
+    cache_path = cache_dir / f"{cache_prefix}_{key}.json"
     if cache_path.exists():
         try:
             return json.loads(cache_path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             logger.warning("ignoring corrupt cache at %s", cache_path)
-    query = _build_overpass_query(bbox)
-    logger.info("fetching public-land polygons for bbox=%s via Overpass", bbox)
+    query = _build_overpass_query(bbox, filters)
+    logger.info("fetching %s polygons for bbox=%s via Overpass", cache_prefix, bbox)
     # Overpass rejects requests with a default python-urllib User-Agent.
     # Identify ourselves per Overpass usage policy
     # (https://operations.osmfoundation.org/policies/api/).
@@ -121,13 +138,25 @@ def fetch_public_osm(
                     len(payload) / 1024, time.time() - t0)
         data = json.loads(payload)
     except Exception:  # noqa: BLE001
-        logger.exception("Overpass fetch failed; candidates will be unannotated")
+        logger.exception("Overpass fetch failed for %s; skipping", cache_prefix)
         return None
     try:
         cache_path.write_bytes(payload)
     except Exception:  # noqa: BLE001
         logger.warning("failed to cache Overpass response at %s", cache_path)
     return data
+
+
+# Back-compat shim — the old name returned PUBLIC_FILTERS results.
+def fetch_public_osm(
+    bbox: tuple[float, float, float, float],
+    cache_dir: str | Path,
+    overpass_url: str = OVERPASS_URL,
+) -> dict | None:
+    return fetch_osm_polygons(
+        bbox, PUBLIC_FILTERS, cache_dir,
+        cache_prefix="public", overpass_url=overpass_url,
+    )
 
 
 def _polygons_from_overpass(data: dict) -> list[Polygon]:
@@ -242,3 +271,44 @@ def annotate(cands: Sequence[Candidate], idx: PublicLandIndex | None) -> int:
         if cp and mp:
             both_public += 1
     return both_public
+
+
+# ---- water-body filtering ---------------------------------------------------
+
+
+def build_water_index_for_bbox(
+    bbox: tuple[float, float, float, float], cache_dir: str | Path,
+) -> PublicLandIndex | None:
+    """Fetch OSM water polygons (lakes, reservoirs, bays) and build a
+    point-in-polygon index. Reuses PublicLandIndex since it's just a
+    polygon-membership test — semantics are unrelated to public access.
+    Returns None on Overpass failure (callers should treat as "no filter").
+    """
+    data = fetch_osm_polygons(bbox, WATER_FILTERS, cache_dir,
+                              cache_prefix="water")
+    if data is None:
+        return None
+    polys = _polygons_from_overpass(data)
+    logger.info("  parsed %d water polygons", len(polys))
+    return PublicLandIndex(polys)
+
+
+def filter_out_water(
+    cands: Sequence[Candidate],
+    water_idx: PublicLandIndex | None,
+) -> tuple[list[Candidate], int]:
+    """Return (kept, dropped_count). A candidate is dropped if either its
+    camera or model lat/lon falls inside any water polygon. If water_idx
+    is None or empty, returns the input list unchanged.
+    """
+    if water_idx is None or len(water_idx) == 0:
+        return list(cands), 0
+    kept: list[Candidate] = []
+    dropped = 0
+    for c in cands:
+        if (water_idx.contains(c.camera_lat, c.camera_lon)
+                or water_idx.contains(c.model_lat, c.model_lon)):
+            dropped += 1
+            continue
+        kept.append(c)
+    return kept, dropped
