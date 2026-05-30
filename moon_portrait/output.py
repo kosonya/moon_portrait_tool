@@ -33,12 +33,31 @@ LINE_COLOR = "#ffaa00"     # yellow-orange
 
 
 LEGEND_HTML = """
-<!-- moon-portrait-map-version: v3 (osm-default-show) -->
+<!-- moon-portrait-map-version: v5 (selected-pair-emphasis-important) -->
 <style>
   /* When this class is on the map root, hide all non-public pairs.
      Markers without a public class (no annotation) are never hidden,
      so the toggle becomes a no-op for candidates that lack the column. */
   .hide-non-public .pair-private { display: none !important; }
+
+  /* Active-pair emphasis: when a popup is open, the JS in this map adds
+     .has-active-pair on the map container and .active-pair on every
+     element belonging to the clicked pair. CSS then dims everything else
+     and slightly boldens the active pair's SVG strokes. Closing the
+     popup clears both classes. */
+  .has-active-pair .pair-elt {
+    opacity: 0.30 !important;
+    transition: opacity 120ms ease-out;
+  }
+  .has-active-pair .pair-elt.active-pair {
+    opacity: 1.0 !important;
+  }
+  .has-active-pair .leaflet-overlay-pane path.pair-elt.active-pair {
+    stroke-width: 4 !important;
+  }
+  .has-active-pair .moon-arrow.pair-elt.active-pair > div {
+    filter: drop-shadow(0 0 2px rgba(0,0,0,0.5));
+  }
   .pair-public-toggle { margin-top: 6px; padding-top: 6px;
                         border-top: 1px solid #ddd; font-size: 11px;
                         color: #444; }
@@ -458,16 +477,16 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
         ).add_to(line_layer)
 
         # Stash pair geometry + intended public class for the JS tagger
-        # to find by lat/lon. Only emit pairs with a known class — pairs
-        # with public_class="" (no annotation) are left untouched and the
-        # toggle is a no-op for them.
-        if public_class:
-            pair_js_data.append({
-                "cam": [rep.camera_lat, rep.camera_lon],
-                "mod": [rep.model_lat, rep.model_lon],
-                "tip": [tip_lat, tip_lon],
-                "cls": public_class,
-            })
+        # to find by lat/lon. ALWAYS emit (even when public_class is "")
+        # so every pair gets the pair-elt + pair-idx-N classes used by the
+        # popup-emphasis effect; the public_class is added only when set.
+        pair_js_data.append({
+            "idx": i,
+            "cam": [rep.camera_lat, rep.camera_lon],
+            "mod": [rep.model_lat, rep.model_lon],
+            "tip": [tip_lat, tip_lon],
+            "cls": public_class,  # may be ""
+        })
 
     # collapsed=False so the toggle list is open by default, and we set
     # autoZIndex so feature-group labels can render the inline-colored swatches.
@@ -490,15 +509,21 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
   function near(a, b) {{
     return Math.abs(a[0] - b[0]) < EPS && Math.abs(a[1] - b[1]) < EPS;
   }}
-  function tagAll() {{
-    // Locate the Leaflet map instance Folium created.
-    let map = null;
+  function addClasses(el, pr) {{
+    if (!el) return;
+    el.classList.add('pair-elt');
+    el.classList.add('pair-idx-' + pr.idx);
+    if (pr.cls) el.classList.add(pr.cls);
+  }}
+  function findMap() {{
     for (const k in window) {{
       if (k.indexOf('map_') === 0 && window[k]
-          && typeof window[k].eachLayer === 'function') {{
-        map = window[k]; break;
-      }}
+          && typeof window[k].eachLayer === 'function') return window[k];
     }}
+    return null;
+  }}
+  function tagAll() {{
+    const map = findMap();
     if (!map || typeof L === 'undefined') {{ return setTimeout(tagAll, 100); }}
     let tagged = 0;
     map.eachLayer(function(layer) {{
@@ -509,8 +534,7 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
         const p = [ll.lat, ll.lng];
         for (const pr of PAIRS) {{
           if (near(p, pr.cam) || near(p, pr.mod)) {{
-            if (layer._path) {{ layer._path.classList.add(pr.cls); tagged++; }}
-            break;
+            addClasses(layer._path, pr); tagged++; break;
           }}
         }}
       }}
@@ -524,8 +548,7 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
           for (const pr of PAIRS) {{
             if ((near(a, pr.cam) && near(b, pr.mod)) ||
                 (near(a, pr.mod) && near(b, pr.tip))) {{
-              if (layer._path) {{ layer._path.classList.add(pr.cls); tagged++; }}
-              break;
+              addClasses(layer._path, pr); tagged++; break;
             }}
           }}
         }}
@@ -535,14 +558,50 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
         const ll = layer.getLatLng();
         const p = [ll.lat, ll.lng];
         for (const pr of PAIRS) {{
-          if (near(p, pr.tip)) {{
-            if (layer._icon) {{ layer._icon.classList.add(pr.cls); tagged++; }}
-            break;
-          }}
+          if (near(p, pr.tip)) {{ addClasses(layer._icon, pr); tagged++; break; }}
         }}
       }}
     }});
     window.__pairTagsApplied = tagged;
+
+    // ---- popup-driven emphasis -------------------------------------
+    // When any popup opens, find which pair it belongs to (by scanning
+    // up to "Pair #N" in the popup HTML) and add .active-pair to that
+    // pair's elements + .has-active-pair on the map container. Closing
+    // the popup clears them.
+    const container = map.getContainer();
+    function clearActive() {{
+      container.classList.remove('has-active-pair');
+      document.querySelectorAll('.active-pair').forEach(el => {{
+        el.classList.remove('active-pair');
+      }});
+    }}
+    map.on('popupopen', function(e) {{
+      let idx = null;
+      const src = e.popup && e.popup._source;
+      // Preferred: read the index off the source layer's tagged classes.
+      const cls = (src && (src._path || src._icon))
+                && (src._path || src._icon).classList;
+      if (cls) {{
+        for (const c of cls) {{
+          if (c.indexOf('pair-idx-') === 0) {{
+            idx = c.substring('pair-idx-'.length); break;
+          }}
+        }}
+      }}
+      // Fallback: parse "Pair #N" out of the rendered popup text.
+      if (idx === null && e.popup && e.popup._contentNode) {{
+        const m = e.popup._contentNode.innerText.match(/Pair #(\\d+)/);
+        if (m) idx = String(parseInt(m[1], 10) - 1);
+      }}
+      if (idx === null) return;
+      clearActive();
+      container.classList.add('has-active-pair');
+      document.querySelectorAll('.pair-idx-' + idx).forEach(el => {{
+        el.classList.add('active-pair');
+      }});
+    }});
+    map.on('popupclose', clearActive);
   }}
   if (document.readyState === 'complete') tagAll();
   else window.addEventListener('load', tagAll);
