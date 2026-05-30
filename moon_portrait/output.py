@@ -33,6 +33,7 @@ LINE_COLOR = "#ffaa00"     # yellow-orange
 
 
 LEGEND_HTML = """
+<!-- moon-portrait-map-version: v3 (osm-default-show) -->
 <style>
   /* When this class is on the map root, hide all non-public pairs.
      Markers without a public class (no annotation) are never hidden,
@@ -183,14 +184,22 @@ def write_blank_map(
     """
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom,
                    tiles=None)
-    folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
+    # See write_map() for the rationale on show=True/False here.
+    folium.TileLayer(
+        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        name="OpenStreetMap",
+        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        max_zoom=19, show=True,
+    ).add_to(m)
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         name="Satellite (Esri)", attr="Tiles &copy; Esri",
+        max_zoom=19, show=False,
     ).add_to(m)
     folium.TileLayer(
         tiles="https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
         name="Topo (Esri)", attr="Tiles &copy; Esri",
+        max_zoom=19, show=False,
     ).add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
 
@@ -274,16 +283,29 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
         center_lon = sum(c.camera_lon for p in pairs for c in p) / sum(len(p) for p in pairs)
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles=None)
-    folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
+    # Only OSM is shown initially (show=True). The other base layers are
+    # registered with show=False so they're available to switch to via the
+    # layer control but don't all start stacked on the map. Without this,
+    # all three render simultaneously initially (60 tiles fetched at once),
+    # Topo wins the z-order, and the layer control then performs add/remove
+    # in a confusing order that breaks the OSM switch path in some browsers.
+    folium.TileLayer(
+        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        name="OpenStreetMap",
+        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        max_zoom=19, show=True,
+    ).add_to(m)
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         name="Satellite (Esri)",
         attr="Tiles &copy; Esri",
+        max_zoom=19, show=False,
     ).add_to(m)
     folium.TileLayer(
         tiles="https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
         name="Topo (Esri)",
         attr="Tiles &copy; Esri",
+        max_zoom=19, show=False,
     ).add_to(m)
 
     cam_layer = folium.FeatureGroup(
