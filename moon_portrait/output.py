@@ -33,7 +33,7 @@ LINE_COLOR = "#ffaa00"     # yellow-orange
 
 
 LEGEND_HTML = """
-<!-- moon-portrait-map-version: v5 (selected-pair-emphasis-important) -->
+<!-- moon-portrait-map-version: v7 (optimistic-delete) -->
 <style>
   /* When this class is on the map root, hide all non-public pairs.
      Markers without a public class (no annotation) are never hidden,
@@ -411,6 +411,14 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
             f"<a href='https://earth.google.com/web/@{rep.camera_lat},{rep.camera_lon},"
             f"{rep.camera_elev_m+1.5}a,500d,30y,{rep.az_required_deg}h,"
             f"{90-rep.alt_required_deg}t,0r' target='_blank'>🌐 camera POV in Google Earth</a>"
+            f"<br><br>"
+            f"<button onclick='window.moonDeletePair && window.moonDeletePair("
+            f"{i},"  # pair index — for instant DOM hide
+            f"{rep.camera_x:.3f},{rep.camera_y:.3f},"
+            f"{rep.model_x:.3f},{rep.model_y:.3f})' "
+            f"style='padding:4px 10px;background:#fff;border:1px solid #c33;"
+            f"color:#c33;cursor:pointer;font-size:11px;border-radius:3px;'>"
+            f"🗑 Delete this pair</button>"
         )
         tooltip = (f"Pair #{i+1} — d={rep.distance_m:.0f}m, "
                    f"alt={rep.alt_required_deg:.1f}°, "
@@ -500,10 +508,81 @@ def write_map(cands: Sequence[Candidate], path: Path | str,
     # Folium to pass `className` through CircleMarker/PolyLine, which is
     # version-dependent in practice.
     tagger_data_json = json.dumps(pair_js_data)
+    snap_m_js = float(cluster_snap_m)
     tagger_js = f"""
 <script>
 (function() {{
   const PAIRS = {tagger_data_json};
+  const SNAP_M = {snap_m_js};
+  // Derive run_id from the URL we were served at:
+  // /download/<run_id>/map.html  -> run_id = group(1)
+  const _m = window.location.pathname.match(/\\/download\\/([^/]+)\\/map\\.html/);
+  const RUN_ID = _m ? _m[1] : null;
+
+  // Optimistic delete: hide the pair's elements right away, close the
+  // popup, then fire the server-side delete in the background. The page
+  // is NOT reloaded — the user can keep clicking other markers while
+  // requests queue up server-side (serialized per-run by a backend lock).
+  // pairIdx is the integer that matches the .pair-idx-<N> class the
+  // tagger applied to every element of this pair.
+  function hidePairLocally(pairIdx) {{
+    document.querySelectorAll('.pair-idx-' + pairIdx).forEach(el => {{
+      el.style.display = 'none';
+      el.classList.add('pair-deleted-locally');
+    }});
+  }}
+  function restorePairLocally(pairIdx) {{
+    document.querySelectorAll('.pair-idx-' + pairIdx).forEach(el => {{
+      el.style.display = '';
+      el.classList.remove('pair-deleted-locally');
+    }});
+  }}
+  function findMapInstance() {{
+    for (const k in window) {{
+      if (k.indexOf('map_') === 0 && window[k]
+          && typeof window[k].closePopup === 'function') return window[k];
+    }}
+    return null;
+  }}
+  window.moonDeletePair = function(pairIdx, camX, camY, modX, modY) {{
+    if (!RUN_ID) {{
+      alert("Can't delete: this map isn't being served by the moon-portrait web UI.");
+      return;
+    }}
+    if (!confirm("Permanently delete this pair from this run? " +
+                 "candidates.csv, candidates.geojson, and map.html will be rewritten."))
+      return;
+
+    // 1) Instant feedback: hide the pair and close the popup right now.
+    hidePairLocally(pairIdx);
+    const m = findMapInstance();
+    if (m) m.closePopup();
+
+    // 2) Fire the server delete without awaiting. Multiple in-flight
+    //    requests are fine — the backend serializes them per run id.
+    fetch("/delete_pair/" + RUN_ID, {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{cam_x: camX, cam_y: camY,
+                             mod_x: modX, mod_y: modY,
+                             snap_m: SNAP_M}}),
+    }}).then(async r => {{
+      if (!r.ok) {{
+        // Server rejected — undo the local hide so the user can see it.
+        restorePairLocally(pairIdx);
+        const txt = await r.text();
+        console.warn("delete_pair failed:", r.status, txt);
+        return;
+      }}
+      // Quietly refresh the parent's sidebar pair count.
+      try {{ if (window.parent && window.parent.refreshRunsList)
+              window.parent.refreshRunsList(); }} catch (e) {{}}
+    }}).catch(e => {{
+      restorePairLocally(pairIdx);
+      console.warn("delete_pair network error:", e);
+    }});
+  }};
+
   if (!PAIRS.length) return;
   const EPS = 1e-6;
   function near(a, b) {{
